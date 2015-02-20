@@ -1,0 +1,152 @@
+#!/usr/bin/env python
+
+import os, sys, glob, re, json, time
+
+CEPHFILE_TEMPLATE='(.*)__(.*)_(.*)__(.*)'
+
+def getoutput(command):
+	proc = os.popen(command, 'r')
+	data = proc.read()
+	proc.close()
+	return data
+
+def get_attr_exist(entry, objid, snapid):
+	# Read our snapset attribute so we can see what should exist
+	output = '/tmp/snapset.' + str(os.getpid())
+
+	result = os.system("attr -q -g ceph.snapset '%s' 2> /dev/null > '%s'" % (entry, output))
+	if result:
+		print "Missing ceph.snapset attr on %s" % entry
+		return []
+
+	# We may need to grab extra attrs to parse, but we cant initially do so because there may be dangling attr
+	next = 1
+	while True:
+		data = getoutput("ceph-dencoder type SnapSet import '%s' decode dump_json 2>/dev/null" % output)
+
+		try:
+			data = json.loads(data)	
+			# IF data loaded OK, break into next section
+			break
+		except:
+			pass
+
+		# On big snapsets, the structure is stored in multiple attributes, starting with ceph.snapset and then ceph.snapset@1, ceph.snapset@2, etc
+		result = os.system("attr -q -g 'ceph.snapset@%d' '%s' 2> /dev/null >> '%s'" % (next, entry, output))
+		next+=1
+
+		# If we couldnt get another attr, and were not able to parse what we previously had, then its not parsable
+		if result:
+			print "Could not parse JSON for %s" % entry
+			return []
+
+
+	if not 'clones' in data:
+		print "'clones' is missing from Snapset for %s" % entry
+		return []
+
+	return [('%x' % obj['snap']) for obj in data['clones']]
+
+def get_disk_exist(headfile, objid, unknown, poolid):
+	exists = [] 
+	for entry in glob.glob(os.path.dirname(headfile)+'/%s__*_%s__%s' % (objid, unknown, poolid)):
+		result = re.search(CEPHFILE_TEMPLATE, os.path.basename(entry))
+		if result:
+			snapid = result.groups(0)[1]
+			if snapid not in ('head', 'snapdir'):
+				exists.append(snapid)
+		else:
+			print 'Could not parse filename %s' % entry
+	return exists
+
+COUNTER = 0
+def process(dir):
+	global COUNTER, TOTAL_OBJECTS
+	for entry in glob.glob(dir + '/*'):
+		if os.path.isdir(entry):
+			process(entry)
+			continue
+		
+		# Keep track of how many objects we've seen
+		COUNTER += 1
+
+		result = re.search(CEPHFILE_TEMPLATE, os.path.basename(entry))
+		if not result:
+			print 'Cannot parse filename: ', entry
+			continue
+				
+		(objid, snapid, unknown, poolid) = result.groups(0)
+
+
+		# Only 'head' objects have snapset attribute
+		if snapid not in ('head','snapdir'):
+			continue
+
+		# May have been removed since 'glob' was initially executed
+		if not os.path.exists(entry):
+			continue
+
+		# Give some idea of progress
+		if COUNTER % 100 == 0:
+			sys.stderr.write( "\r%d/%d (%.1f%%)" % (COUNTER, TOTAL_OBJECTS, 100.0 * COUNTER/TOTAL_OBJECTS) )
+			sys.stderr.flush()
+
+		attr_exist = get_attr_exist(entry, objid, snapid)
+		disk_exist = get_disk_exist(entry, objid, unknown, poolid)
+
+		should_exist = [x for x in attr_exist if x not in disk_exist]
+		should_not_exist = [x for x in disk_exist if x not in attr_exist]
+
+		# Provide information about the placement group that contains the dodgy snap
+		if len(should_exist) or len(should_not_exist):
+			data = getoutput('ceph osd lspools')
+
+			# Fixme: how to best map the poolid to pool name for this command?
+			result = re.search(poolid + ' ([^,]+)', data)
+			poolname = result.groups(0)[0]
+
+			os.system("ceph osd map '%s' '%s'" % ( poolname, objid.replace('\u','_')))
+
+		# Print out the discrepancies
+		if len(should_exist):
+			print "\t", entry, ': snaps are in attr but not on disk\n', should_exist
+			sys.stdout.flush()
+		if len(should_not_exist):
+			print "\t", entry, ': snaps are on disk but not in attr\n', should_not_exist
+			sys.stdout.flush()
+
+		# Avoid impacting cluster users too much
+		#time.sleep(0.001)
+
+dir = sys.argv[1]
+placement_groups = []
+pgids = []
+TOTAL_OBJECTS = 0
+
+# Strip trailing slash
+if dir[-1:] == '/':
+	dir = dir[:-1]
+
+# Allow searching a single PG
+search = dir +'/*'
+if dir[-5:] == '_head':
+	search = dir
+elif dir[-7:] != 'current':
+	print "ERROR: can only search entire 'current' directory or a single PG"
+	sys.exit(1)
+
+for entry in glob.glob(search):
+	if not '_head' in entry:
+		continue
+	placement_groups.append(entry)
+	pgids.append(os.path.basename(entry).split('_')[0])
+
+proc = os.popen('ceph pg dump 2>/dev/null', 'r')
+for line in proc:
+	result = re.search('^([^\t]+)\t([^\t]+)', line)
+	if result and result.groups(0)[0] in pgids:
+		TOTAL_OBJECTS += int(result.groups(0)[1])
+proc.close()
+
+for entry in placement_groups:
+	process(entry)
